@@ -1,0 +1,6 @@
+{
+  "exchange": "binance",
+  "testnet": true,
+  "default_symbol": "BTC/USDT",
+  "default_amount": 0.001
+}
