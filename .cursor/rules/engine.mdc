@@ -1,0 +1,572 @@
+---
+description: TradingView webhook engine guidance — alert setup, Flask server patterns, CCXT execution, and recipes for this strategy
+alwaysApply: true
+---
+
+# TradingView Webhooks on TradingHost
+
+You are helping a user build a TradingView webhook receiver that executes trades via CCXT. This file covers webhook-specific knowledge — TradingView alert setup, Flask server patterns, CCXT execution, and recipes. See `tradinghost.mdc` for platform conventions (deployment, env vars, logging, persistence, config).
+
+## Pattern Overview
+
+This is NOT a traditional strategy engine — it is a **trigger-based execution pattern**. TradingView does the analysis (indicators, signals, Pine Script strategies). Your code does one thing: receive the HTTP POST and execute the trade.
+
+The flow:
+1. User creates a TradingView alert with a Pine Script condition or indicator
+2. TradingView sends an HTTP POST to your webhook URL when the alert fires
+3. Your Flask server validates the request (checks the secret)
+4. Your code parses the payload (symbol, side, amount) and executes the trade via CCXT
+5. The result is logged to SQLite and returned in the HTTP response
+
+Key architectural decisions:
+- **Flask** (not FastAPI) — simpler, synchronous, fewer dependencies. CCXT's sync API is fine for webhook-triggered execution since alerts don't arrive faster than one per second
+- **CCXT** for exchange interaction — same unified API as the standalone CCXT template
+- **SQLite** for execution logging — every webhook received and every trade executed is logged
+- **Webhook secret** for authentication — prevents unauthorized trade execution
+- **One port required** — the Flask server must bind to an allocated TradingHost port
+
+## Port Allocation (Critical)
+
+This template REQUIRES at least 1 allocated port in the TradingHost deployment. Without a port, the webhook server has no way to receive incoming HTTP requests.
+
+### CRITICAL: TradingView only sends to ports 80 and 443
+
+TradingView rejects webhook URLs on any port other than 80 or 443. TradingHost exposes your service on a high NodePort (e.g. 31234), so **TradingView cannot reach `http://<ip>:<nodePort>` directly** — you must put a public HTTPS endpoint on port 443 in front of it. Two standard options:
+
+1. **Tunnel (simplest):** run a tunneling client (Cloudflare Tunnel or ngrok) that gives you a public `https://...` hostname and forwards to your `targetPort` inside the pod. You can run the tunnel client as a second strategy in the same deployment (it shares the pod network namespace, so it can reach `localhost:<targetPort>`).
+2. **External reverse proxy:** a server you control (Caddy/Nginx + Let's Encrypt) listening on 443 that forwards to the deployment's `<ip>:<nodePort>`.
+
+Point the TradingView alert at the public `https://.../webhook` URL from your tunnel/proxy — never at the raw NodePort. For local testing with `curl` (which allows any port), you can still hit `http://<ip>:<nodePort>/webhook` directly.
+
+### How TradingHost Ports Work
+
+When you allocate ports in your deployment resources, TradingHost provisions NodePort services on the Kubernetes cluster:
+
+```python
+import os, json
+
+PORTS = json.loads(os.environ.get('TRADINGHOST_PORTS', '[]'))
+```
+
+`TRADINGHOST_PORTS` is a JSON array. Each entry has:
+- `name` — display label (e.g. `"port-1"`)
+- `nodePort` — the **external-facing** NodePort (high port number). Reachable by clients that allow arbitrary ports; NOT reachable by TradingView (80/443 only). Visible in the deployment details panel.
+- `targetPort` — the **container-internal** port. This is what Flask binds to.
+- `protocol` — `"TCP"`
+
+**The distinction matters:**
+- Flask binds to `targetPort` (inside the container): `app.run(host='0.0.0.0', port=PORTS[0]['targetPort'])`
+- The external NodePort is `<deployment-ip>:<nodePort>` — but TradingView can only POST to a port-80/443 URL, so front it with a tunnel/reverse proxy on 443 (see "CRITICAL: TradingView only sends to ports 80 and 443" above).
+
+```python
+if not PORTS:
+    print(json.dumps({'level': 'error', 'msg': 'No ports allocated — webhook server cannot start. Allocate at least 1 port in deployment resources.'}), flush=True)
+    exit(1)
+
+target_port = PORTS[0]['targetPort']
+node_port = PORTS[0]['nodePort']
+```
+
+### Finding Your Webhook URL
+
+After deploying on TradingHost:
+1. Open the deployment detail panel
+2. Look at the **Ports** section — it shows the `nodePort` (external port number) and the deployment's external IP
+3. The raw deployment endpoint is `http://<deployment-ip>:<nodePort>/webhook` (e.g. `http://185.92.220.42:31234/webhook`). This works for `curl` and custom callers, but **TradingView will reject it** because it is not on port 80/443.
+4. For TradingView, expose a port-443 HTTPS endpoint in front of that NodePort (Cloudflare Tunnel, ngrok, or a reverse proxy — see "CRITICAL: TradingView only sends to ports 80 and 443"). Use the resulting `https://.../webhook` URL in your alert.
+
+## TradingView Setup
+
+### Step 1: Create an Alert in TradingView
+
+1. Open any chart on [TradingView](https://www.tradingview.com)
+2. Click the **Alerts** button (clock icon in the right panel) → **Create Alert**
+3. Set your condition — this can be:
+   - A price crossing a level (e.g. "BTCUSDT crossing above 70000")
+   - An indicator signal (e.g. "RSI crossing below 30")
+   - A Pine Script strategy's order execution
+4. Under **Notifications**, check **Webhook URL**
+5. Enter your **port-443 HTTPS** webhook URL (from your tunnel/reverse proxy): `https://<your-public-host>/webhook`. TradingView rejects URLs on the raw NodePort.
+6. Set the **Alert message** (see below for format)
+7. Click **Create**
+
+### Step 2: Configure the Alert Message
+
+The alert message is the JSON body TradingView sends to your webhook. Set it in the "Message" field of the alert dialog.
+
+**Simple format (manual values):**
+```json
+{
+  "secret": "your-webhook-secret",
+  "symbol": "BTC/USDT",
+  "side": "buy",
+  "amount": 0.001
+}
+```
+
+**Dynamic format (TradingView variables):**
+```json
+{
+  "secret": "your-webhook-secret",
+  "symbol": "{{ticker}}",
+  "side": "{{strategy.order.action}}",
+  "amount": 0.001,
+  "price": {{close}}
+}
+```
+
+### TradingView Alert Variables
+
+These placeholders are replaced by TradingView when the alert fires:
+
+| Variable | Description | Example value |
+|---|---|---|
+| `{{ticker}}` | Symbol in TradingView format | `BTCUSDT`, `AAPL` |
+| `{{exchange}}` | Exchange name | `BINANCE`, `NASDAQ` |
+| `{{close}}` | Current close price (number, no quotes) | `68432.50` |
+| `{{open}}` | Current open price | `67890.00` |
+| `{{high}}` | Current high price | `68500.00` |
+| `{{low}}` | Current low price | `67500.00` |
+| `{{volume}}` | Current volume | `1234.56` |
+| `{{time}}` | Alert trigger time (UTC) | `2024-01-15T14:30:00Z` |
+| `{{timenow}}` | Current time (UTC) | `2024-01-15T14:30:05Z` |
+| `{{strategy.order.action}}` | Strategy action | `buy` or `sell` |
+| `{{strategy.order.price}}` | Strategy order price | `68000.00` |
+| `{{strategy.order.contracts}}` | Strategy order size | `0.5` |
+| `{{strategy.order.id}}` | Strategy order ID | `Long Entry` |
+| `{{strategy.market_position}}` | Current position | `long`, `short`, or `flat` |
+| `{{strategy.prev_market_position}}` | Previous position | `long`, `short`, or `flat` |
+
+**Important:** `{{ticker}}` returns the TradingView symbol format (e.g. `BTCUSDT`), not CCXT format (e.g. `BTC/USDT`). Your webhook code should handle the conversion, or use a fixed symbol in the alert message.
+
+### Step 3: Symbol Format Conversion
+
+TradingView symbols don't match CCXT symbols. Handle the mapping:
+
+```python
+def normalize_symbol(tv_symbol: str, default_symbol: str) -> str:
+    """Convert TradingView symbol format to CCXT format."""
+    if '/' in tv_symbol:
+        return tv_symbol  # Already in CCXT format
+    # Common crypto pairs — strip the quote currency suffix
+    for quote in ['USDT', 'BUSD', 'USD', 'BTC', 'ETH', 'EUR']:
+        if tv_symbol.endswith(quote) and len(tv_symbol) > len(quote):
+            base = tv_symbol[:-len(quote)]
+            return f'{base}/{quote}'
+    return default_symbol  # Fallback to config default
+```
+
+## Suggestions
+
+When building the webhook receiver, propose these patterns:
+
+### Execution Log Dashboard
+
+Build an HTML status page on the same Flask server showing recent executions:
+
+```python
+@app.route('/')
+def dashboard():
+    rows = db.execute(
+        'SELECT timestamp, symbol, side, amount, status, error, fill_price FROM executions ORDER BY id DESC LIMIT 20'
+    ).fetchall()
+    html = '<html><head><title>Webhook Status</title></head><body>'
+    html += '<h1>Recent Executions</h1><table border="1"><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Amount</th><th>Status</th><th>Price</th><th>Error</th></tr>'
+    for r in rows:
+        ts = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(r[0]))
+        html += f'<tr><td>{ts}</td><td>{r[1]}</td><td>{r[2]}</td><td>{r[3]}</td><td>{r[4]}</td><td>{r[6] or ""}</td><td>{r[5] or ""}</td></tr>'
+    html += '</table></body></html>'
+    return html
+```
+
+Access at `http://<deployment-ip>:<nodePort>/` in your browser.
+
+### Position Tracking
+
+Track current positions so you can show state and add logic like "don't buy if already long":
+
+```python
+@app.route('/positions')
+def positions():
+    try:
+        balance = exchange.fetch_balance()
+        positions = {k: v for k, v in balance['total'].items() if v > 0 and k != 'USDT'}
+        return jsonify({'positions': positions})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+```
+
+### Rate Limiting
+
+Protect the webhook endpoint from abuse:
+
+```python
+from functools import wraps
+import time
+
+request_times = []
+
+def rate_limit(max_per_minute=30):
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            now = time.time()
+            request_times[:] = [t for t in request_times if now - t < 60]
+            if len(request_times) >= max_per_minute:
+                return jsonify({'error': 'rate limited'}), 429
+            request_times.append(now)
+            return f(*args, **kwargs)
+        return wrapper
+    return decorator
+
+@app.route('/webhook', methods=['POST'])
+@rate_limit(max_per_minute=30)
+def webhook():
+    ...
+```
+
+### Health Endpoint
+
+```python
+@app.route('/health')
+def health():
+    try:
+        exchange.fetch_time()
+        exchange_ok = True
+    except:
+        exchange_ok = False
+    return jsonify({
+        'status': 'ok' if exchange_ok else 'degraded',
+        'exchange_connected': exchange_ok,
+        'uptime': int(time.time() - start_time),
+    })
+```
+
+## Recipes
+
+### Validating the Webhook Secret
+
+Always validate the secret before executing any trade:
+
+```python
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        log('warn', 'Invalid JSON payload')
+        return jsonify({'error': 'invalid json'}), 400
+
+    if data.get('secret') != os.environ['WEBHOOK_SECRET']:
+        log('warn', 'Unauthorized webhook attempt', ip=request.remote_addr)
+        return jsonify({'error': 'unauthorized'}), 401
+
+    # ... process the webhook
+```
+
+The `force=True` parameter makes Flask parse the body as JSON regardless of Content-Type header (TradingView sometimes sends `text/plain`). The `silent=True` parameter returns `None` instead of raising on invalid JSON.
+
+### Executing a Market Order
+
+```python
+def execute_trade(symbol, side, amount):
+    try:
+        if side == 'buy':
+            order = exchange.create_market_buy_order(symbol, amount)
+        elif side == 'sell':
+            order = exchange.create_market_sell_order(symbol, amount)
+        else:
+            return {'status': 'error', 'error': f'Unknown side: {side}'}
+
+        log('info', 'Order filled', symbol=symbol, side=side, amount=amount,
+            order_id=order['id'], fill_price=order.get('average'))
+        return {
+            'status': 'filled',
+            'order_id': order['id'],
+            'fill_price': order.get('average'),
+            'filled_amount': order.get('filled'),
+        }
+    except Exception as e:
+        log('error', 'Order failed', symbol=symbol, side=side, amount=amount, error=str(e))
+        return {'status': 'error', 'error': str(e)}
+```
+
+### Executing a Limit Order
+
+```python
+def execute_limit(symbol, side, amount, price):
+    try:
+        order = exchange.create_limit_order(symbol, side, amount, price)
+        log('info', 'Limit order placed', symbol=symbol, side=side, amount=amount, price=price, order_id=order['id'])
+        return {'status': 'placed', 'order_id': order['id']}
+    except Exception as e:
+        log('error', 'Limit order failed', symbol=symbol, side=side, error=str(e))
+        return {'status': 'error', 'error': str(e)}
+```
+
+### Supporting Multiple Symbols from One Alert
+
+Use `{{ticker}}` in the alert message and normalize it:
+
+```json
+{
+  "secret": "your-secret",
+  "symbol": "{{ticker}}",
+  "side": "{{strategy.order.action}}",
+  "amount": 0.001
+}
+```
+
+```python
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    data = request.get_json(force=True, silent=True)
+    # ... secret validation ...
+
+    raw_symbol = data.get('symbol', config['default_symbol'])
+    symbol = normalize_symbol(raw_symbol, config['default_symbol'])
+    side = data.get('side', 'buy').lower()
+    amount = float(data.get('amount', config['default_amount']))
+
+    result = execute_trade(symbol, side, amount)
+
+    db.execute(
+        'INSERT INTO executions (timestamp, webhook_payload, symbol, side, amount, order_id, status, error, fill_price, ip_address) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        (int(time.time()), json.dumps(data), symbol, side, amount,
+         result.get('order_id'), result['status'], result.get('error'),
+         result.get('fill_price'), request.remote_addr)
+    )
+    db.commit()
+
+    return jsonify(result), 200 if result['status'] != 'error' else 500
+```
+
+### Position Sizing Based on Account Balance
+
+Instead of a fixed amount, size the trade as a percentage of available balance:
+
+```python
+def calculate_amount(symbol, side, pct_of_balance=0.1):
+    balance = exchange.fetch_balance()
+    if side == 'buy':
+        ticker = exchange.fetch_ticker(symbol)
+        free_quote = balance['free'].get('USDT', 0)
+        max_amount = (free_quote * pct_of_balance) / ticker['last']
+        return round(max_amount, 6)
+    else:
+        base = symbol.split('/')[0]
+        free_base = balance['free'].get(base, 0)
+        return round(free_base * pct_of_balance, 6)
+```
+
+Use in the webhook handler when amount is not specified or is `"auto"` in the alert message.
+
+### Conditional Logic (Only Buy If No Position)
+
+```python
+def has_position(symbol):
+    base = symbol.split('/')[0]
+    balance = exchange.fetch_balance()
+    return balance['total'].get(base, 0) > 0
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    # ... validation ...
+    if side == 'buy' and has_position(symbol):
+        log('info', 'Skipped buy — already have position', symbol=symbol)
+        return jsonify({'status': 'skipped', 'reason': 'already_positioned'})
+    # ... execute ...
+```
+
+### Logging to SQLite
+
+Every webhook creates a row, whether it succeeds or fails:
+
+```python
+def log_execution(data, symbol, side, amount, result, ip):
+    db.execute(
+        'INSERT INTO executions (timestamp, webhook_payload, symbol, side, amount, order_id, status, error, fill_price, ip_address) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        (int(time.time()), json.dumps(data), symbol, side, amount,
+         result.get('order_id'), result['status'], result.get('error'),
+         result.get('fill_price'), ip)
+    )
+    db.commit()
+```
+
+### Building an HTML Status Page
+
+Serve a simple page showing the last 20 executions, accessible in your browser at the deployment's external URL:
+
+```python
+@app.route('/')
+def status_page():
+    rows = db.execute(
+        'SELECT timestamp, symbol, side, amount, status, error, fill_price, ip_address FROM executions ORDER BY id DESC LIMIT 20'
+    ).fetchall()
+
+    stats = db.execute(
+        "SELECT COUNT(*), SUM(CASE WHEN status='filled' THEN 1 ELSE 0 END), SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) FROM executions"
+    ).fetchone()
+
+    # Build HTML table (use Jinja2 templates for more complex pages)
+    html = f'''<html><head><title>Webhook Status</title>
+    <style>body {{ font-family: sans-serif; margin: 2em; }} table {{ border-collapse: collapse; width: 100%; }} th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}</style>
+    </head><body>
+    <h1>Webhook Execution Log</h1>
+    <p>Total: {stats[0]} | Filled: {stats[1]} | Errors: {stats[2]}</p>
+    <table><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Amount</th><th>Status</th><th>Price</th><th>Error</th><th>IP</th></tr>'''
+    for r in rows:
+        ts = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(r[0]))
+        html += f'<tr><td>{ts}</td><td>{r[1]}</td><td>{r[2]}</td><td>{r[3]}</td><td>{r[4]}</td><td>{r[6] or ""}</td><td>{r[5] or ""}</td><td>{r[7]}</td></tr>'
+    html += '</table></body></html>'
+    return html
+```
+
+## Exchange Setup with CCXT
+
+### General pattern (any exchange)
+
+```python
+import ccxt, os
+
+exchange_class = getattr(ccxt, config['exchange'])
+exchange = exchange_class({
+    'apiKey': os.environ['EXCHANGE_API_KEY'],
+    'secret': os.environ['EXCHANGE_API_SECRET'],
+    'password': os.environ.get('EXCHANGE_API_PASSPHRASE', ''),
+})
+if config.get('testnet'):
+    exchange.set_sandbox_mode(True)
+exchange.load_markets()
+```
+
+Credentials (`EXCHANGE_API_KEY`, `EXCHANGE_API_SECRET`, optional `EXCHANGE_API_PASSPHRASE`, and `WEBHOOK_SECRET`) are set as TradingHost strategy secrets (environment variables), never in `config.json`. See `tradinghost.mdc` → "Secrets & Credentials".
+
+### Binance
+
+1. Get API keys from https://www.binance.com/en/my/settings/api-management
+2. Enable "Spot & Margin Trading" permission
+3. For testnet: use https://testnet.binance.vision (separate keys from https://testnet.binance.vision/key/generate)
+
+### Bybit
+
+1. Get API keys from https://www.bybit.com/app/user/api-management
+2. Set permissions to "Read-Write"
+3. Testnet: https://testnet.bybit.com (separate account + keys)
+
+### OKX
+
+1. Get API keys from https://www.okx.com/account/my-api
+2. Set Trade permission
+3. OKX requires a passphrase — add `"api_passphrase"` to `config.json`
+
+## Risk Management
+
+Webhook-based execution has unique risks. Always advise the user:
+
+### Authentication
+- **Always validate `webhook_secret`** — without it, anyone who finds your URL can place trades on your account
+- Use a strong random string (32+ characters) as the secret
+- Never log the webhook secret in plaintext
+
+### Rate Limiting
+- Rate-limit the webhook endpoint (e.g. 30 requests per minute) to prevent runaway execution from misconfigured alerts
+- TradingView can fire alerts rapidly if the condition triggers on every bar
+
+### Position Limits
+- Set `max_amount` in config — never execute a trade larger than this regardless of what the webhook says
+- Check existing positions before opening new ones — avoid doubling down unintentionally
+
+```python
+MAX_AMOUNT = config.get('max_amount', 0.01)
+
+amount = min(float(data.get('amount', config['default_amount'])), MAX_AMOUNT)
+```
+
+### Audit Everything
+- Log every webhook payload to SQLite, including the IP address
+- Log every trade result (success or failure)
+- Check the execution log regularly for unexpected patterns
+
+### Duplicate Prevention
+- TradingView can send the same alert multiple times (e.g. on reconnection)
+- Consider deduplication: hash the payload and check against recent entries in SQLite
+
+```python
+import hashlib
+
+def is_duplicate(payload_str, window_seconds=60):
+    h = hashlib.sha256(payload_str.encode()).hexdigest()
+    recent = db.execute(
+        'SELECT COUNT(*) FROM executions WHERE timestamp > ? AND webhook_payload = ?',
+        (int(time.time()) - window_seconds, payload_str)
+    ).fetchone()[0]
+    return recent > 0
+```
+
+### Start on Testnet
+- Set `testnet: true` in config
+- Get testnet API keys from your exchange's testnet portal
+- Send test webhooks with curl (see Testing section)
+- Verify: orders execute, SQLite logs correctly, the status page works
+- Only switch to live after confirming correct behavior
+
+## Testing
+
+### Testnet Workflow
+
+1. Set `testnet: true` in `config.json`
+2. Get testnet API keys from the exchange's testnet portal
+3. Deploy to TradingHost with at least 1 port allocated
+4. Send test webhooks with curl
+
+### Sending Test Webhooks with curl
+
+From your local machine, send a test request to your deployment:
+
+```bash
+# Replace with your deployment's IP and nodePort
+WEBHOOK_URL="http://<deployment-ip>:<nodePort>/webhook"
+
+# Test buy order
+curl -X POST "$WEBHOOK_URL" \
+  -H 'Content-Type: application/json' \
+  -d '{"secret":"your-webhook-secret","symbol":"BTC/USDT","side":"buy","amount":0.001}'
+
+# Test sell order
+curl -X POST "$WEBHOOK_URL" \
+  -H 'Content-Type: application/json' \
+  -d '{"secret":"your-webhook-secret","symbol":"BTC/USDT","side":"sell","amount":0.001}'
+
+# Test with TradingView-style ticker (no slash)
+curl -X POST "$WEBHOOK_URL" \
+  -H 'Content-Type: application/json' \
+  -d '{"secret":"your-webhook-secret","symbol":"BTCUSDT","side":"buy","amount":0.001}'
+
+# Test with bad secret (should return 401)
+curl -X POST "$WEBHOOK_URL" \
+  -H 'Content-Type: application/json' \
+  -d '{"secret":"wrong-secret","symbol":"BTC/USDT","side":"buy","amount":0.001}'
+```
+
+### What to Verify Before Going Live
+
+- Webhook server starts and binds to the allocated port
+- `/health` endpoint returns exchange connectivity status
+- Test webhook with curl executes a trade on testnet
+- Bad secret returns 401 (not a trade)
+- Invalid JSON returns 400
+- Execution is logged to SQLite
+- Status page (`/`) shows recent executions
+- SIGTERM produces clean shutdown (no partial state)
+- Restart produces clean startup (SQLite is intact, exchange reconnects)
+- Rate limiting rejects excessive requests
+- `max_amount` cap is enforced regardless of webhook payload
+- Symbol normalization handles both `BTCUSDT` and `BTC/USDT`
+
+### TradingView Alert Testing
+
+1. Create a test alert in TradingView with a condition that fires immediately (e.g. "price crosses above 0")
+2. Set the webhook URL to your deployment
+3. Check the deployment console for the execution log
+4. Check the status page for the result
+5. Delete the test alert when done

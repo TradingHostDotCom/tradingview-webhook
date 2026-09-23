@@ -1,0 +1,258 @@
+---
+description: TradingHost platform conventions for this strategy — deployment model, env vars, secrets, logging, persistence
+alwaysApply: true
+---
+
+# TradingHost Platform
+
+This project deploys on TradingHost — managed Kubernetes hosting for trading bots. This file documents the platform conventions that apply regardless of which trading engine you use.
+
+## Deployment Model
+
+The user's workflow on TradingHost:
+1. **Strategy** — this git repository, linked through the TradingHost GitHub App installed on the repo's account (a push to the tracked branch redeploys via webhook within seconds; a 5-minute poll reconciles anything missed)
+2. **Deployment** — a Kubernetes pod running the strategy 24/7 with persistent storage
+
+The strategy code runs as a child process inside the deployment container. The container provides:
+- Persistent storage at `TRADINGHOST_DATA_DIR`
+- Allocated network ports via `TRADINGHOST_PORTS`
+- 30-second graceful shutdown window on SIGTERM
+- Health monitoring with email alerts on crash
+- Real-time log streaming to the TradingHost console
+- Automatic dependency installation from requirements.txt / package.json on deploy
+
+## Operating on TradingHost via MCP
+
+If you are an AI agent connected to TradingHost's MCP server (not just editing files locally), you can drive the whole lifecycle with these tools:
+
+0. `get_onboarding_status` — start here. It returns the user's current `stage` (`connect_github` → `link_strategy` → `subscribe` → `create_deployment` → `deploy_strategy` → `ready`), a `nextAction` describing which tool or panel page completes the step, and a `panelUrl` for the two steps that must happen in the browser (connecting GitHub, paying for a plan). Call it again after each browser step.
+1. `resolve_strategy_by_repo` — check whether this git repo is already linked as a strategy (pass the HTTPS clone URL). Avoids creating duplicates. If the user does not know the exact URL, `list_github_repos` (with `search`) lists the connected account's repositories — never guess a URL.
+2. `create_strategy` — link this GitHub repo as a strategy if it isn't already (only GitHub is supported). The TradingHost GitHub App must be installed on the account that owns the repo (`get_github_status` reports the installations; a 400 `GITHUB_NOT_INSTALLED` means install it from the panel's Strategies page). TradingHost never stores the code or a personal token: it records the repo, branch and installation, learns about pushes from the App's webhook (with a ~5-minute reconciliation poll), and each deployment pulls its pinned commit straight from GitHub with a short-lived installation token — so the deployed code follows what you push.
+3. `set_deployment_strategy_secrets` — set the credential env vars the strategy expects (e.g. `EXCHANGE_API_KEY`, `EXCHANGE_API_SECRET`). Use `list_deployment_strategy_secret_keys` to see what is already set. Secret values are write-only for agents: no tool returns them. If the user needs to see or check a value, tell them to sign in to the TradingHost panel, open the deployment, hover the strategy in the **Strategies** section, click its key icon, then **Show values**; never ask them to paste a secret into the chat.
+4. `create_deployment` — create the Kubernetes deployment (choose a location; allocate at least 1 port if the strategy serves HTTP). Returns `402 subscription_required` with a Billing page link in `errors` when the account has no active plan — send the user there, payment cannot be taken through the API.
+5. `deploy_strategy` — deploy the strategy onto the deployment.
+6. `get_deployment_logs` (runner/system output) and `get_deployment_strategy_logs` (the strategy's own stdout/stderr) — watch it run.
+
+Two facts that bite if you forget them:
+- **The repository IS the code.** There is no file read/write API on TradingHost; edit locally, push to the tracked branch, then call `sync_strategy` — deployments with auto-update on are redeployed to the new commit. Feature branches are invisible until merged into the tracked branch.
+- **Changing a secret requires a redeploy, not a restart.** A restart-in-place (`restart_deployed_strategy`) keeps the existing environment, so a newly added/changed secret will NOT be picked up. Use `redeploy_strategy` (or `deploy_strategy`) after changing secrets so the strategy process is recreated with the new environment.
+
+## Environment Variables
+
+```python
+import os, json
+
+DATA_DIR = os.environ.get('TRADINGHOST_DATA_DIR', '/data')
+PORTS = json.loads(os.environ.get('TRADINGHOST_PORTS', '[]'))
+```
+
+- `TRADINGHOST_DATA_DIR` — Persistent directory (default `/data`). Backed by a Kubernetes PersistentVolumeClaim. Survives restarts, crashes, and redeployments. Use for SQLite databases and state files.
+- `TRADINGHOST_PORTS` — JSON array of allocated port mappings. Each entry: `{"name": str, "nodePort": int, "targetPort": int, "protocol": str}`. Bind servers to `0.0.0.0:{targetPort}`. The `nodePort` is the externally-reachable port.
+- **Strategy secrets** — every secret the user configures for this strategy (API keys, private keys, webhook secrets) is injected as its own environment variable. Read them with `os.environ["BINANCE_API_KEY"]`. See "Secrets & Credentials" below. The platform also injects `TRADINGHOST_STRATEGY_ID` and, for SDK-based strategies, `TRADINGHOST_WS_URL` / `TRADINGHOST_SECRET`.
+
+## Graceful Shutdown (SIGTERM)
+
+The deployment sends SIGTERM when the strategy is stopped, restarted, or the deployment is deleted. You have 30 seconds to clean up before SIGKILL.
+
+```python
+import signal
+
+running = True
+
+def shutdown(sig, frame):
+    global running
+    running = False
+
+signal.signal(signal.SIGTERM, shutdown)
+signal.signal(signal.SIGINT, shutdown)
+```
+
+On shutdown: cancel open orders, close exchange connections, commit any pending SQLite writes, flush logs.
+
+SIGTERM goes to your main process only (the Docker / Kubernetes model). If your code starts child processes (a framework's trading process, workers, a separate web server), forward SIGTERM to them and wait for them to exit. Once your main process exits, or the 30 seconds run out, every process left in its process group is killed. Do not detach child processes into their own session (`start_new_session=True`, `setsid`, Node `detached: true`): those escape the cleanup.
+
+A stop the platform asked for (restart, redeploy, removal, deployment shutdown) is never counted as a crash, whatever the exit code. Any other exit that is not code 0, including an out-of-memory kill, is a crash and is restarted automatically.
+
+## Structured Logging
+
+Write JSON to stdout. TradingHost captures it and displays in the deployment console with level filtering and search.
+
+```python
+import json
+
+def log(level: str, msg: str, **kwargs):
+    print(json.dumps({'level': level, 'msg': msg, **kwargs}), flush=True)
+
+log('info', 'Bot started', exchange='binance', symbol='BTC/USDT')
+log('error', 'Order failed', error=str(e))
+log('warn', 'Rate limited, backing off', wait_seconds=30)
+```
+
+Supported levels: `info`, `warn`, `error`, `debug`. Always include `flush=True` in Python to prevent buffering.
+
+## Persistent State with SQLite
+
+SQLite is pre-installed in every container (Python `sqlite3` stdlib, Node.js `better-sqlite3` global).
+
+```python
+import sqlite3
+
+db = sqlite3.connect(os.path.join(DATA_DIR, 'state.db'))
+db.execute('CREATE TABLE IF NOT EXISTS orders (...)')
+db.commit()
+```
+
+Design for restart safety: on startup, always query your exchange/broker for actual state and reconcile with your SQLite records. Never assume a clean slate — the container may have restarted mid-operation.
+
+## Secrets & Credentials
+
+Secrets (exchange API keys, wallet private keys, webhook secrets) are delivered as **environment variables**, NOT via files. This is the only supported and secure path — there is no user-facing way to write a file into `TRADINGHOST_DATA_DIR`, so do not instruct the user to "put your keys in config.json on the server".
+
+How it works:
+1. The user (or an AI agent via MCP) sets named secrets on the strategy-deployment. Each becomes an environment variable.
+2. Values are AES-256-GCM encrypted at rest and injected into the strategy process at deploy/redeploy time.
+3. Your code reads them from the environment:
+
+```python
+import os
+
+api_key = os.environ["BINANCE_API_KEY"]      # set as a TradingHost strategy secret
+api_secret = os.environ["BINANCE_API_SECRET"]
+```
+
+Rules for secret names:
+- Must be valid env var names: `[A-Za-z_][A-Za-z0-9_]*` (e.g. `BINANCE_API_KEY`).
+- Reserved prefixes are rejected: `TRADINGHOST_`, `RUNNER_`, `TEL_WS_`, `LD_`, `DYLD_`, and common system names (`PATH`, `HOME`, `NODE_*`, `PYTHON*`, proxy/cert vars). Pick your own clear names like `EXCHANGE_API_KEY`.
+- Up to 50 secrets per strategy-deployment, 10KB per value.
+- Setting or changing a secret only takes effect on the next **redeploy** (a restart-in-place keeps the old environment). See "Operating on TradingHost via MCP".
+
+Document the exact env var names your strategy expects (in this file and the README) so the user knows what to set.
+
+## Configuration Pattern (non-secret tunables)
+
+Use `config.json` only for **non-secret** runtime tunables — symbols, intervals, thresholds, paper/testnet flags. Never put API keys or private keys in it. Persist the live copy at `{DATA_DIR}/config.json`, seeded once from the repo's `config.example.json`:
+
+```python
+import shutil
+
+config_path = os.path.join(DATA_DIR, 'config.json')
+if not os.path.exists(config_path):
+    shutil.copy('config.example.json', config_path)
+    log('info', 'Seeded config.json from config.example.json', path=config_path)
+
+with open(config_path) as f:
+    config = json.load(f)
+```
+
+Because `config.example.json` ships in git and the seeded copy lives on the persistent volume, the user can hand-edit tunables there without redeploying code — but secrets must always come from environment variables, never this file.
+
+## Dependencies
+
+List all Python dependencies in `requirements.txt` with minimum version pins:
+```
+ccxt>=4.4.0
+flask>=3.0.0
+```
+
+TradingHost installs them automatically on deploy. The container already has numpy, pandas, scipy, scikit-learn, requests, and websockets pre-installed — don't add those to requirements.txt unless you need a specific version (re-listing them just slows down deploys).
+
+For technical-analysis indicators, use the pure-Python `ta` or `pandas-ta` packages (add them to requirements.txt). Do NOT depend on `TA-Lib` / `import talib` — the underlying TA-Lib C library is NOT installed and cannot be apt-installed in the non-root container, so `pip install TA-Lib` will fail to build. (Freqtrade is the exception — it bundles its own TA-Lib build via its own dependency chain.)
+
+For Node.js, use `package.json`. `better-sqlite3` is pre-installed globally.
+
+## Suggestions
+
+When building a strategy, propose these patterns to the user:
+
+### Web Panel for Monitoring
+
+Build a Flask/FastAPI web panel on an allocated port. This gives the user a browser-accessible dashboard showing what their bot is doing.
+
+```python
+from flask import Flask, jsonify
+import threading, time
+
+app = Flask(__name__)
+start_time = time.time()
+
+@app.route('/health')
+def health():
+    return jsonify({'status': 'ok', 'uptime': time.time() - start_time})
+
+@app.route('/state')
+def state():
+    return jsonify({
+        'positions': get_current_positions(),
+        'pnl': calculate_pnl(),
+        'orders': get_open_orders(),
+        'last_signal': get_last_signal(),
+    })
+
+# Start in background thread
+port = PORTS[0]['targetPort'] if PORTS else 5000
+threading.Thread(target=lambda: app.run(host='0.0.0.0', port=port), daemon=True).start()
+```
+
+Remind the user they need at least 1 port allocated in their deployment resources for a web panel.
+
+### Recommended Code Architecture
+
+Suggest splitting into separate files as the project grows:
+- `main.py` — entry point, starts strategy + panel, handles shutdown
+- `strategy.py` — trading logic (exchange connection, signal generation, order execution)
+- `panel.py` — web dashboard (Flask/FastAPI on allocated port)
+- `state.py` — SQLite helpers (read/write state, position tracking, P&L)
+
+### Restart Reconciliation
+
+On every startup:
+1. Load SQLite state (what you THINK your positions/orders are)
+2. Query the exchange/broker for actual positions and open orders
+3. Reconcile: cancel orphaned orders, update local state, handle unexpected fills
+4. Only then start the main trading loop
+
+This pattern is critical — without it, a restart mid-trade can cause duplicate orders or missed exits.
+
+### Health Endpoint
+
+Always suggest a `/health` endpoint on the web panel. TradingHost's health monitor checks if the process is alive, but a health endpoint lets the user verify the strategy is functioning correctly (exchange connected, last trade time, error rate).
+
+## Pre-installed System Packages
+
+The container image includes:
+- Python 3 with (pre-installed via pip): numpy, pandas, scipy, scikit-learn, requests, websockets, aiosqlite — plus the `sqlite3` standard library
+- Node.js 24 with (global): better-sqlite3
+- System: curl, ca-certificates, build-essential, libffi-dev, libssl-dev, python3-dev (compilers and headers are present, so pip packages that ship a C-extension sdist can build)
+
+You can install additional pip/npm packages via requirements.txt / package.json. You cannot install system packages via apt (non-root container) — so any pip package that needs a system C library at build time (e.g. `TA-Lib`, which needs the TA-Lib C library) will fail. Prefer pure-Python alternatives (`ta`, `pandas-ta`) or packages that ship prebuilt manylinux wheels. Note: `git` is not installed in the runtime image — your code cannot shell out to git.
+
+## Multi-Strategy Deployments
+
+A single deployment can run multiple strategies. All strategies in the same deployment share:
+- The `/data` persistent volume (`TRADINGHOST_DATA_DIR`) — coordinate via SQLite, files, or lock files
+- The pod network namespace — strategies can communicate via `localhost` TCP/HTTP
+- The `TRADINGHOST_PORTS` env var — all strategies see the same allocated ports
+
+Source trees are separate (`/data/.tradinghost/strategies/{id}`, platform-managed — do not write there), but persistent state under `/data` is shared.
+
+## Inbound Webhooks and HTTPS
+
+Exposed ports (`TRADINGHOST_PORTS`) are plain HTTP NodePorts on high, non-standard port numbers (e.g. 31234). Most trading strategies only make outbound HTTPS connections to exchange APIs and do not need any inbound traffic.
+
+If you DO need to receive inbound webhooks, be aware of the caller's constraints. In particular, **TradingView only delivers webhooks to ports 80 and 443** and rejects any other port number outright — so a raw `http://<ip>:<nodePort>` URL pointing at a TradingHost NodePort will never receive TradingView alerts. To accept such webhooks you must put a public endpoint on port 443 in front of the deployment, for example:
+- A tunneling service (Cloudflare Tunnel, ngrok) that terminates TLS on a public hostname and forwards to your `targetPort` inside the pod.
+- A reverse proxy you control (Caddy, Nginx with Let's Encrypt) on a server that listens on 443 and forwards to the deployment's `<ip>:<nodePort>`.
+
+Callers that allow arbitrary ports (custom scripts, your own services) can hit `http://<ip>:<nodePort>` directly.
+
+## What NOT to Do
+
+- Do NOT hardcode API keys in source files — read them from environment variables (TradingHost strategy secrets)
+- Do NOT tell the user to put credentials in config.json on the server — there is no way to write secrets into the data directory; use env-var strategy secrets
+- Do NOT put secrets in `config.json` or `config.example.json` — those are for non-secret tunables only and `config.example.json` is committed to git
+- Do NOT write state files outside of `TRADINGHOST_DATA_DIR` — anything else is ephemeral
+- Do NOT ignore SIGTERM — your process will be killed after 30 seconds regardless
+- Do NOT assume the container won't restart — design all logic to be restart-safe
+- Do NOT use print() without flush=True in Python — output may buffer and not appear in logs
+- Do NOT add numpy/pandas/scipy/scikit-learn to requirements.txt — they're pre-installed and slow to reinstall
+- Do NOT depend on `TA-Lib` / `import talib` — the TA-Lib C library is not installed; use the pure-Python `ta` or `pandas-ta` packages instead
